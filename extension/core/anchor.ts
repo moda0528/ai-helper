@@ -114,6 +114,18 @@ function rangePlacementRect(range: Range): DOMRect {
   return rangeRect(range);
 }
 
+/** A caret-like rect at the visual end of the range's final line. */
+function rangeEndPlacementRect(range: Range): DOMRect {
+  const rects = range.getClientRects();
+  for (let i = rects.length - 1; i >= 0; i--) {
+    const rect = rects[i]!;
+    if (!usableRect(rect)) continue;
+    return new DOMRect(rect.right, rect.top, 1, Math.max(1, rect.height));
+  }
+  const rect = rangeRect(range);
+  return new DOMRect(rect.right, rect.top, 1, Math.max(1, rect.height));
+}
+
 /** Placement rect for a selection, preferring the focus/caret end. */
 function selectionPlacementRect(sel: Selection, range: Range): DOMRect {
   if (sel.focusNode) {
@@ -396,15 +408,20 @@ function selectionSpan(anchor: SelectionAnchor): number {
  */
 function chooseReleasedAnchor(
   current: SelectionAnchor | null,
-  bestDrag: SelectionAnchor | null
+  bestDrag: SelectionAnchor | null,
+  preferLongest = false
 ): SelectionAnchor | null {
   if (!current) return bestDrag;
   if (!bestDrag || current.messageRoot !== bestDrag.messageRoot) return current;
   const currentSpan = selectionSpan(current);
   const bestSpan = selectionSpan(bestDrag);
-  const tinyHostFragment =
-    bestSpan >= 8 && currentSpan < bestSpan && currentSpan <= 4;
-  return tinyHostFragment ? bestDrag : current;
+  // ChatGPT can shorten the browser range by only a word or punctuation, not
+  // necessarily by 50%+. For the sticky-native strategy the drag snapshot is
+  // authoritative whenever it contains more of what the user selected.
+  if (preferLongest && bestSpan > currentSpan) return bestDrag;
+  const hostTruncatedSelection =
+    bestSpan >= 8 && currentSpan < bestSpan && currentSpan <= bestSpan * 0.5;
+  return hostTruncatedSelection ? bestDrag : current;
 }
 
 /**
@@ -627,13 +644,29 @@ export function attachSelectionHandler(
   getMessageRoots: () => HTMLElement[],
   onAsk: AskButtonHandler,
   findRootForNode?: RootForNode,
-  selectionStrategy: "native" | "pointer" = "native"
+  selectionStrategy: "native" | "native-sticky" | "pointer" = "native"
 ): () => void {
+  const stickyNative = selectionStrategy === "native-sticky";
   let pending: SelectionAnchor | null = null;
   let selectionTimer: ReturnType<typeof setTimeout> | null = null;
   let pointerSelecting = false;
+  /** Best pointer-derived range seen during the drag (ChatGPT fallback only). */
   let bestDragAnchor: SelectionAnchor | null = null;
+  /**
+   * Exact browser selection captured while the mouse is still down. ChatGPT
+   * can replace this range on release when its own selection UI mounts, so
+   * this snapshot is the source of truth whenever it exists.
+   */
+  let bestNativeDragAnchor: SelectionAnchor | null = null;
   let pointerReleaseLocked = false;
+  /**
+   * Chrome can finish extending a native text selection after pointerup has
+   * already dispatched. ChatGPT may then mount its own selection UI and
+   * mutate the range again. For native-sticky, keep a tiny post-release
+   * capture window and retain the longest real range seen in that window.
+   */
+  let stickyReleaseSettling = false;
+  let stickyReleaseTimer: ReturnType<typeof setTimeout> | null = null;
   let pointerSelectionStart: PointerSelectionStart | null = null;
 
   const hide = () => {
@@ -665,29 +698,60 @@ export function attachSelectionHandler(
       positionFloating(existing, placementTarget);
       return;
     }
-    const button = createAskButton(() => pending, onAsk, hide);
+    const button = createAskButton(() => {
+      if (!pending) return null;
+      if (pending.messageRoot.isConnected) return pending;
+
+      // ChatGPT occasionally replaces the rendered assistant turn between
+      // mouseup and the click on our pill. Recover the same quote in the new
+      // turn instead of silently doing nothing with a detached DOM node.
+      const recovered = recoverSelectionAnchor(
+        getMessageRoots(),
+        pending.quotedText,
+        pending.rect
+      );
+      if (recovered) pending = recovered;
+      return pending?.messageRoot.isConnected ? pending : null;
+    }, onAsk, hide);
     positionFloating(button, placementTarget);
     document.body.appendChild(button);
     log.debug("Ask button shown");
   };
 
   const show = (anchor: SelectionAnchor) => {
+    // Keep the geometry captured from Chrome's *live* native selection.
+    // Rebuilding the range from offsets here was a ChatGPT-only divergence
+    // from Claude/Gemini and could move the pill when ChatGPT had already
+    // mutated/re-rendered the underlying markdown nodes.
     pending = anchor;
-    placeFloating(anchor);
+    placeFloating(pending);
+  };
+
+  const rememberLongestNative = (anchor: SelectionAnchor | null): SelectionAnchor | null => {
+    if (!anchor) return bestDragAnchor;
+    if (
+      !bestDragAnchor ||
+      bestDragAnchor.messageRoot !== anchor.messageRoot ||
+      selectionSpan(anchor) >= selectionSpan(bestDragAnchor)
+    ) {
+      bestDragAnchor = anchor;
+    }
+    return bestDragAnchor;
+  };
+
+  const captureStickyNative = (): SelectionAnchor | null => {
+    const current = getSelectionAnchor(getMessageRoots(), findRootForNode);
+    const best = rememberLongestNative(current);
+    if (best) show(best);
+    return best;
   };
 
   const refreshFromSelection = (allowHostMutation = true) => {
     const anchor = getSelectionAnchor(getMessageRoots(), findRootForNode);
     if (anchor) {
       if (pointerSelecting) {
-        if (
-          !bestDragAnchor ||
-          bestDragAnchor.messageRoot !== anchor.messageRoot ||
-          selectionSpan(anchor) >= selectionSpan(bestDragAnchor)
-        ) {
-          bestDragAnchor = anchor;
-        }
-        show(anchor);
+        rememberLongestNative(anchor);
+        show(stickyNative ? bestDragAnchor ?? anchor : anchor);
         return;
       }
       // Immediately after pointer release, ChatGPT may swap the real range
@@ -721,8 +785,70 @@ export function attachSelectionHandler(
 
   // Capture during the event, before the host's selection toolbar can clear
   // the native range.  A delayed-only read loses it on ChatGPT.
-  const onMouseUp = () => {
-    if (selectionStrategy === "pointer") return;
+  const finishPointerSelection = (clientX?: number, clientY?: number) => {
+    if (!pointerSelecting) return;
+
+    // Read the native range first, while we're still inside the release event.
+    // On ChatGPT this is often still the exact highlighted sentence here, but
+    // can be replaced by the site's own selection UI immediately afterward.
+    const nativeAtRelease = getSelectionAnchor(
+      getMessageRoots(),
+      findRootForNode
+    );
+    if (
+      nativeAtRelease &&
+      (!bestNativeDragAnchor ||
+        bestNativeDragAnchor.messageRoot !== nativeAtRelease.messageRoot ||
+        selectionSpan(nativeAtRelease) >= selectionSpan(bestNativeDragAnchor))
+    ) {
+      bestNativeDragAnchor = nativeAtRelease;
+    }
+
+    let pointerAnchor: SelectionAnchor | null = null;
+    if (
+      pointerSelectionStart &&
+      typeof clientX === "number" &&
+      typeof clientY === "number"
+    ) {
+      pointerAnchor = getPointerSelectionAnchor(
+        pointerSelectionStart,
+        clientX,
+        clientY,
+        getMessageRoots(),
+        findRootForNode
+      );
+    }
+
+    // IMPORTANT: prefer the browser's real selection captured during the drag.
+    // The coordinate-derived range is only a fallback.  Making pointerAnchor
+    // win unconditionally caused ChatGPT selections to lose words and made the
+    // Ask button appear away from the actual highlight.
+    const released =
+      bestNativeDragAnchor ??
+      chooseReleasedAnchor(nativeAtRelease, bestDragAnchor) ??
+      pointerAnchor ??
+      bestDragAnchor;
+
+    pointerSelecting = false;
+    pointerSelectionStart = null;
+    bestDragAnchor = null;
+    bestNativeDragAnchor = null;
+    if (released) show(released);
+    else hide();
+    pointerReleaseLocked = true;
+  };
+
+  const onMouseUp = (e: MouseEvent) => {
+    if (selectionStrategy === "pointer") {
+      // Normal pointer events fire first; mouseup is a reliable fallback when
+      // the host page swallows/cancels pointerup.
+      finishPointerSelection(e.clientX, e.clientY);
+      return;
+    }
+    if (stickyNative && stickyReleaseSettling) {
+      captureStickyNative();
+      return;
+    }
     refreshFromSelection(!pointerReleaseLocked);
     if (!pointerReleaseLocked) scheduleRefresh(40);
   };
@@ -747,7 +873,25 @@ export function attachSelectionHandler(
   };
 
   const onSelectionChange = () => {
-    if (selectionStrategy === "pointer") return;
+    if (selectionStrategy === "pointer") {
+      // ChatGPT: snapshot Chrome's exact selection while the drag is active.
+      // Do not display from this event; pointermove/release controls the pill.
+      if (!pointerSelecting) return;
+      const native = getSelectionAnchor(getMessageRoots(), findRootForNode);
+      if (
+        native &&
+        (!bestNativeDragAnchor ||
+          bestNativeDragAnchor.messageRoot !== native.messageRoot ||
+          selectionSpan(native) >= selectionSpan(bestNativeDragAnchor))
+      ) {
+        bestNativeDragAnchor = native;
+      }
+      return;
+    }
+    if (stickyNative && (pointerSelecting || stickyReleaseSettling)) {
+      captureStickyNative();
+      return;
+    }
     refreshFromSelection(!pointerReleaseLocked);
     if (!pointerReleaseLocked) scheduleRefresh(80);
   };
@@ -761,7 +905,13 @@ export function attachSelectionHandler(
       return;
     }
     bestDragAnchor = null;
+    bestNativeDragAnchor = null;
     pointerReleaseLocked = false;
+    stickyReleaseSettling = false;
+    if (stickyReleaseTimer) {
+      clearTimeout(stickyReleaseTimer);
+      stickyReleaseTimer = null;
+    }
     pointerSelectionStart = null;
     if (selectionTimer) clearTimeout(selectionTimer);
     selectionTimer = null;
@@ -782,12 +932,15 @@ export function attachSelectionHandler(
         caret && rootFromTarget?.contains(caret.node)
           ? rootFromTarget
           : rootFromCaret;
-      if (!caret || !messageRoot || !messageRoot.contains(caret.node)) {
+      if (!rootFromTarget && !rootFromCaret) {
         pointerSelecting = false;
+        hide();
         return;
       }
       pointerSelecting = true;
-      pointerSelectionStart = { ...caret, messageRoot };
+      if (caret && messageRoot && messageRoot.contains(caret.node)) {
+        pointerSelectionStart = { ...caret, messageRoot };
+      }
       hide();
       return;
     }
@@ -802,17 +955,39 @@ export function attachSelectionHandler(
     if (!pointerSelecting || (e.buttons & 1) === 0) return;
 
     if (selectionStrategy === "pointer") {
-      if (!pointerSelectionStart) return;
-      const anchor = getPointerSelectionAnchor(
-        pointerSelectionStart,
-        e.clientX,
-        e.clientY,
-        getMessageRoots(),
-        findRootForNode
-      );
-      if (!anchor) return;
-      bestDragAnchor = anchor;
-      show(anchor);
+      // Native first: this exactly matches what the user can see highlighted.
+      // Pointer geometry is kept only for the cases where ChatGPT has already
+      // cleared/replaced the native selection.
+      const native = getSelectionAnchor(getMessageRoots(), findRootForNode);
+      if (
+        native &&
+        (!bestNativeDragAnchor ||
+          bestNativeDragAnchor.messageRoot !== native.messageRoot ||
+          selectionSpan(native) >= selectionSpan(bestNativeDragAnchor))
+      ) {
+        bestNativeDragAnchor = native;
+      }
+
+      const pointer = pointerSelectionStart
+        ? getPointerSelectionAnchor(
+            pointerSelectionStart,
+            e.clientX,
+            e.clientY,
+            getMessageRoots(),
+            findRootForNode
+          )
+        : null;
+      if (
+        pointer &&
+        (!bestDragAnchor ||
+          bestDragAnchor.messageRoot !== pointer.messageRoot ||
+          selectionSpan(pointer) >= selectionSpan(bestDragAnchor))
+      ) {
+        bestDragAnchor = pointer;
+      }
+
+      const displayAnchor = bestNativeDragAnchor ?? pointer ?? bestDragAnchor;
+      if (displayAnchor) show(displayAnchor);
       return;
     }
 
@@ -825,34 +1000,55 @@ export function attachSelectionHandler(
     if (!pointerSelecting) return;
 
     if (selectionStrategy === "pointer") {
-      const released = pointerSelectionStart
-        ? getPointerSelectionAnchor(
-            pointerSelectionStart,
-            e.clientX,
-            e.clientY,
-            getMessageRoots(),
-            findRootForNode
-          ) ?? bestDragAnchor
-        : bestDragAnchor;
-      pointerSelecting = false;
-      pointerSelectionStart = null;
-      bestDragAnchor = null;
-      if (released) show(released);
-      else hide();
-      pointerReleaseLocked = true;
+      finishPointerSelection(e.clientX, e.clientY);
       return;
     }
 
     captureDragSelection.cancel();
+
+    if (stickyNative) {
+      // Do NOT lock immediately. Chrome's final native selection can land
+      // after pointerup dispatch. Keep listening briefly, while always
+      // retaining the longest range so ChatGPT's own toolbar cannot shrink it.
+      captureStickyNative();
+      pointerSelecting = false;
+      stickyReleaseSettling = true;
+
+      requestAnimationFrame(() => {
+        if (!stickyReleaseSettling) return;
+        captureStickyNative();
+        requestAnimationFrame(() => {
+          if (stickyReleaseSettling) captureStickyNative();
+        });
+      });
+
+      stickyReleaseTimer = setTimeout(() => {
+        stickyReleaseTimer = null;
+        if (!stickyReleaseSettling) return;
+        captureStickyNative();
+        stickyReleaseSettling = false;
+        pointerReleaseLocked = true;
+        const released = bestDragAnchor;
+        bestDragAnchor = null;
+        if (released) show(released);
+        else hide();
+      }, 120);
+      return;
+    }
+
     const current = getSelectionAnchor(getMessageRoots(), findRootForNode);
-    const released = chooseReleasedAnchor(current, bestDragAnchor);
+    const released = chooseReleasedAnchor(current, bestDragAnchor, false);
     pointerSelecting = false;
     bestDragAnchor = null;
     if (released) show(released);
-    // Freeze the released quote until the next real pointer/keyboard
-    // selection interaction.  Host-generated selectionchange events must
-    // not shrink it.
     pointerReleaseLocked = true;
+  };
+
+  const onPointerCancel = () => {
+    if (selectionStrategy !== "pointer" || !pointerSelecting) return;
+    // A cancel can be caused by host UI taking pointer capture. Preserve the
+    // last valid/native selection if one exists instead of dropping the pill.
+    finishPointerSelection();
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -887,6 +1083,7 @@ export function attachSelectionHandler(
   document.addEventListener("pointerdown", onPointerDown, true);
   document.addEventListener("pointermove", onPointerMove, true);
   document.addEventListener("pointerup", onPointerUp, true);
+  document.addEventListener("pointercancel", onPointerCancel, true);
   document.addEventListener("selectionchange", onSelectionChange);
   window.addEventListener("scroll", onScroll, true);
 
@@ -898,11 +1095,13 @@ export function attachSelectionHandler(
     document.removeEventListener("pointerdown", onPointerDown, true);
     document.removeEventListener("pointermove", onPointerMove, true);
     document.removeEventListener("pointerup", onPointerUp, true);
+    document.removeEventListener("pointercancel", onPointerCancel, true);
     document.removeEventListener("selectionchange", onSelectionChange);
     window.removeEventListener("scroll", onScroll, true);
     captureDragSelection.cancel();
     onScroll.cancel();
     if (selectionTimer) clearTimeout(selectionTimer);
+    if (stickyReleaseTimer) clearTimeout(stickyReleaseTimer);
     hide();
   };
 }

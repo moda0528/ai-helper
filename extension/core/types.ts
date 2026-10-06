@@ -22,14 +22,15 @@ export interface Thread {
 }
 
 /** How the Ask button captures a highlight on this site. */
-export type SelectionStrategy = "native" | "pointer";
+export type SelectionStrategy = "native" | "native-sticky" | "pointer";
 
 /** Site-specific hooks so the core engine stays agnostic of host DOM. */
 export interface SiteAdapter {
   siteId: string;
   /**
-   * ChatGPT's selected-text overlay can replace the browser selection with a
-   * tiny fragment; use `"pointer"` there. Other sites keep `"native"`.
+   * `"native-sticky"` keeps the longest native selection captured during a
+   * drag. ChatGPT uses it because its own selected-text UI can shorten the
+   * browser range immediately after pointer release.
    */
   selectionStrategy?: SelectionStrategy;
   getConversationId(): string;

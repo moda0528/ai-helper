@@ -9,6 +9,10 @@ export interface DomAdapterConfig {
   selectionStrategy?: SelectionStrategy;
   /** Stable markers for an assistant turn, most stable first. */
   assistantSelectors: string[];
+  /** Prefer the outer conversation-turn wrapper when selectors match nested nodes too. */
+  preferOutermostAssistant?: boolean;
+  /** Use the whole assistant turn as the anchor/highlight root instead of its first markdown descendant. */
+  useAssistantTurnAsContentRoot?: boolean;
   /** Used only when none of `assistantSelectors` match (UI variants / A/B tests). */
   assistantFallbackSelectors: string[];
   userSelectors: string[];
@@ -49,6 +53,16 @@ function queryInnermost(selectors: readonly string[]): HTMLElement[] {
   );
 }
 
+function queryOutermost(selectors: readonly string[]): HTMLElement[] {
+  if (selectors.length === 0) return [];
+  const all = Array.from(
+    document.querySelectorAll<HTMLElement>(selectors.join(", "))
+  );
+  return all.filter(
+    (el) => !all.some((other) => other !== el && other.contains(el))
+  );
+}
+
 function describeElement(el: Element | null): string {
   if (!el) return "none";
   return `<${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}>`;
@@ -68,14 +82,17 @@ export function createDomAdapter(config: DomAdapterConfig): SiteAdapter {
   let reconcileImpl: () => void = () => {};
 
   const contentRootOf = (turn: HTMLElement): HTMLElement =>
-    turn.querySelector<HTMLElement>(config.contentSelector) ?? turn;
+    config.useAssistantTurnAsContentRoot
+      ? turn
+      : turn.querySelector<HTMLElement>(config.contentSelector) ?? turn;
 
   const findAssistantTurns = (): HTMLElement[] => {
-    const stable = queryInnermost(config.assistantSelectors);
+    const queryAssistant = config.preferOutermostAssistant ? queryOutermost : queryInnermost;
+    const stable = queryAssistant(config.assistantSelectors);
     const turns =
       stable.length > 0
         ? stable
-        : queryInnermost(config.assistantFallbackSelectors);
+        : queryAssistant(config.assistantFallbackSelectors);
 
     const summary =
       stable.length > 0

@@ -222,7 +222,7 @@ export async function bootEngine(adapter: SiteAdapter): Promise<() => void> {
       }
       return result;
     },
-  });
+  }, adapter.siteId);
 
   sidebar.setThreads(threads);
 
@@ -387,5 +387,6 @@ export async function bootEngine(adapter: SiteAdapter): Promise<() => void> {
     stopObserving();
     clearInterval(tick);
     unregisterDiagnostics();
+    sidebar.dispose();
   };
 }

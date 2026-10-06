@@ -16,6 +16,11 @@ const log = createLogger("sidebar");
 
 export const HOST_ID = SIDEBAR_HOST_ID;
 const COMPOSER_MAX_HEIGHT = 160;
+const SIDEBAR_DEFAULT_WIDTH = 360;
+const SIDEBAR_MIN_WIDTH = 280;
+const SIDEBAR_MAX_WIDTH = 760;
+const SIDEBAR_WIDTH_STORAGE_KEY = "ai-helper:sidebar-width";
+const PAGE_LAYOUT_STYLE_ID = "ai-helper-page-layout-style";
 const FONT_STACK = `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
 
 export interface SidebarCallbacks {
@@ -31,6 +36,7 @@ export interface SidebarCallbacks {
 const STYLES = `
 :host {
   all: initial;
+  --ai-helper-sidebar-width: ${SIDEBAR_DEFAULT_WIDTH}px;
 }
 * {
   box-sizing: border-box;
@@ -60,15 +66,15 @@ const STYLES = `
   transition: right 0.2s ease;
 }
 .fab.panel-open {
-  right: calc(min(360px, 100vw) + 10px);
+  right: calc(var(--ai-helper-sidebar-width) + 10px);
 }
 .panel {
   position: fixed;
   top: 0;
   right: 0;
   height: 100vh;
-  width: 360px;
-  max-width: min(360px, 100vw);
+  width: var(--ai-helper-sidebar-width);
+  max-width: calc(100vw - 48px);
   background: #f7f7f5;
   color: #1a1a1a;
   font-family: ${FONT_STACK};
@@ -82,6 +88,34 @@ const STYLES = `
   transform: translateX(0);
   transition: transform 0.2s ease;
   pointer-events: auto;
+}
+.panel.resizing,
+.fab.resizing {
+  transition: none;
+}
+.resize-handle {
+  position: absolute;
+  top: 0;
+  left: -5px;
+  width: 10px;
+  height: 100%;
+  cursor: ew-resize;
+  touch-action: none;
+  z-index: 3;
+}
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 2px;
+  background: transparent;
+  transition: background 120ms ease;
+}
+.resize-handle:hover::after,
+.resize-handle.dragging::after {
+  background: rgba(26,26,26,0.24);
 }
 .panel.collapsed {
   transform: translateX(100%);
@@ -307,10 +341,24 @@ export class Sidebar {
   private activeId: string | null = null;
   /** Start collapsed so we don't cover ChatGPT chrome until needed. */
   private collapsed = true;
+  private panelWidth = SIDEBAR_DEFAULT_WIDTH;
+  private resizeHandle!: HTMLElement;
   private callbacks: SidebarCallbacks;
+  /** Tell host apps to recompute responsive layout after panel width changes. */
+  private notifyHostResize = rafThrottle(() => {
+    window.dispatchEvent(new Event("resize"));
+  });
 
-  constructor(callbacks: SidebarCallbacks) {
+  /** Close the sidebar with Escape when focus is anywhere on the host page. */
+  private onDocumentKeyDown = (event: KeyboardEvent): void => {
+    if (event.key !== "Escape" || this.collapsed) return;
+    this.closeAllMenus();
+    this.setCollapsed(true);
+  };
+
+  constructor(callbacks: SidebarCallbacks, siteId: string) {
     this.callbacks = callbacks;
+    document.documentElement.dataset.aiHelperSite = siteId;
 
     let host = document.getElementById(HOST_ID);
     if (!host) {
@@ -336,11 +384,29 @@ export class Sidebar {
     ] as const) {
       this.shadow.addEventListener(type, (event) => event.stopPropagation());
     }
+    this.installPageLayoutStyle();
     this.renderShell();
+    this.loadSavedWidth();
+    window.addEventListener("resize", this.onWindowResize);
+    document.addEventListener("keydown", this.onDocumentKeyDown, true);
+  }
+
+  dispose(): void {
+    window.removeEventListener("resize", this.onWindowResize);
+    document.removeEventListener("keydown", this.onDocumentKeyDown, true);
+    document.documentElement.classList.remove(
+      "ai-helper-sidebar-open",
+      "ai-helper-sidebar-resizing"
+    );
+    document.documentElement.style.removeProperty(
+      "--ai-helper-page-sidebar-width"
+    );
+    this.notifyHostResize.cancel();
   }
 
   /** Re-append the host if the page's own rendering removed it from <body>. */
   ensureMounted(): void {
+    this.installPageLayoutStyle();
     if (this.host.isConnected) return;
     log.debug("Sidebar host was removed by the page; re-attaching");
     document.body.appendChild(this.host);
@@ -366,6 +432,7 @@ export class Sidebar {
     ) as HTMLElement | null;
     card?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     card?.querySelector("textarea")?.focus({ preventScroll: true });
+    this.scrollThreadToBottom(threadId);
   }
 
   /** Accordion: opening a thread closes the others; clicking the open one closes it. */
@@ -378,6 +445,7 @@ export class Sidebar {
       this.callbacks.onFocusThread(threadId);
     }
     this.renderList();
+    if (!wasOpen) this.scrollThreadToBottom(threadId);
   }
 
   /** Update the in-flight assistant bubble without rebuilding the whole list. */
@@ -416,6 +484,126 @@ export class Sidebar {
       "aria-label",
       collapsed ? "Open highlight threads" : "Close highlight threads"
     );
+    document.documentElement.classList.toggle(
+      "ai-helper-sidebar-open",
+      !collapsed
+    );
+    document.documentElement.style.setProperty(
+      "--ai-helper-page-sidebar-width",
+      `${this.panelWidth}px`
+    );
+    this.notifyHostResize();
+  }
+
+  private installPageLayoutStyle(): void {
+    if (document.getElementById(PAGE_LAYOUT_STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = PAGE_LAYOUT_STYLE_ID;
+    style.textContent = `
+      html.ai-helper-sidebar-open body {
+        margin-right: var(--ai-helper-page-sidebar-width, ${SIDEBAR_DEFAULT_WIDTH}px) !important;
+        transition: margin-right 180ms ease;
+      }
+
+      /*
+       * ChatGPT currently keeps its app shell viewport-sized, so shrinking
+       * <body> does not reliably affect the conversation.  Reserve the
+       * sidebar width *inside main* instead.  This changes the actual layout
+       * width seen by ChatGPT's responsive thread/composer containers and
+       * updates continuously while the resize handle is dragged.
+       */
+      html[data-ai-helper-site="chatgpt"].ai-helper-sidebar-open body {
+        margin-right: 0 !important;
+        width: 100% !important;
+        max-width: none !important;
+        overflow-x: clip !important;
+      }
+      html[data-ai-helper-site="chatgpt"].ai-helper-sidebar-open main {
+        box-sizing: border-box !important;
+        min-width: 0 !important;
+        width: calc(100% - var(--ai-helper-page-sidebar-width, ${SIDEBAR_DEFAULT_WIDTH}px)) !important;
+        max-width: calc(100% - var(--ai-helper-page-sidebar-width, ${SIDEBAR_DEFAULT_WIDTH}px)) !important;
+        flex: 0 1 calc(100% - var(--ai-helper-page-sidebar-width, ${SIDEBAR_DEFAULT_WIDTH}px)) !important;
+        padding-right: 0 !important;
+        margin-right: var(--ai-helper-page-sidebar-width, ${SIDEBAR_DEFAULT_WIDTH}px) !important;
+        transition: width 180ms ease, max-width 180ms ease, margin-right 180ms ease !important;
+      }
+      /* The composer can be positioned independently of the scrolling thread
+         on some ChatGPT builds; keep its usable right edge with main. */
+      html[data-ai-helper-site="chatgpt"].ai-helper-sidebar-open #thread-bottom-container {
+        box-sizing: border-box !important;
+        width: auto !important;
+        max-width: calc(100vw - var(--ai-helper-page-sidebar-width, ${SIDEBAR_DEFAULT_WIDTH}px)) !important;
+        right: var(--ai-helper-page-sidebar-width, ${SIDEBAR_DEFAULT_WIDTH}px) !important;
+      }
+
+      html.ai-helper-sidebar-resizing body,
+      html[data-ai-helper-site="chatgpt"].ai-helper-sidebar-resizing main {
+        transition: none !important;
+      }
+    `;
+    (document.head ?? document.documentElement).appendChild(style);
+  }
+
+  private clampPanelWidth(width: number): number {
+    const viewportMax = Math.max(180, window.innerWidth - 48);
+    const viewportMin = Math.min(SIDEBAR_MIN_WIDTH, viewportMax);
+    return Math.round(
+      Math.min(
+        Math.min(SIDEBAR_MAX_WIDTH, viewportMax),
+        Math.max(viewportMin, width)
+      )
+    );
+  }
+
+  private setPanelWidth(width: number): void {
+    this.panelWidth = this.clampPanelWidth(width);
+    this.host.style.setProperty(
+      "--ai-helper-sidebar-width",
+      `${this.panelWidth}px`
+    );
+    document.documentElement.style.setProperty(
+      "--ai-helper-page-sidebar-width",
+      `${this.panelWidth}px`
+    );
+    if (!this.collapsed) this.notifyHostResize();
+  }
+
+  private loadSavedWidth(): void {
+    try {
+      chrome.storage.local.get(SIDEBAR_WIDTH_STORAGE_KEY, (result) => {
+        if (chrome.runtime.lastError) return;
+        const saved = result?.[SIDEBAR_WIDTH_STORAGE_KEY];
+        if (typeof saved === "number" && Number.isFinite(saved)) {
+          this.setPanelWidth(saved);
+        }
+      });
+    } catch {
+      // If the extension context was reloaded, keep the default width.
+    }
+  }
+
+  private saveWidth(): void {
+    try {
+      chrome.storage.local.set({
+        [SIDEBAR_WIDTH_STORAGE_KEY]: this.panelWidth,
+      });
+    } catch {
+      // Width persistence is non-critical.
+    }
+  }
+
+  private onWindowResize = (): void => {
+    this.setPanelWidth(this.panelWidth);
+  };
+
+  private scrollThreadToBottom(threadId: string): void {
+    requestAnimationFrame(() => {
+      const replies = this.shadow.querySelector(
+        `[data-thread-id="${CSS.escape(threadId)}"] .replies`
+      ) as HTMLElement | null;
+      if (replies) replies.scrollTop = replies.scrollHeight;
+    });
   }
 
   private closeAllMenus(): void {
@@ -452,11 +640,63 @@ export class Sidebar {
     `
     );
     this.shadow.appendChild(this.panel);
+    this.resizeHandle = document.createElement("div");
+    this.resizeHandle.className = "resize-handle";
+    this.resizeHandle.title = "Drag to resize sidebar";
+    this.resizeHandle.setAttribute("aria-hidden", "true");
+    this.panel.prepend(this.resizeHandle);
+    this.installResizeHandling();
     this.listEl = this.panel.querySelector(".list") as HTMLElement;
 
     this.shadow.addEventListener("click", (event) => {
       const target = event.target as Element | null;
       if (!target?.closest(".menu")) this.closeAllMenus();
+    });
+  }
+
+  private installResizeHandling(): void {
+    let pointerId: number | null = null;
+
+    const finish = () => {
+      if (pointerId == null) return;
+      const id = pointerId;
+      pointerId = null;
+      try {
+        if (this.resizeHandle.hasPointerCapture(id)) {
+          this.resizeHandle.releasePointerCapture(id);
+        }
+      } catch {
+        // Capture may already have been released by the browser.
+      }
+      this.resizeHandle.classList.remove("dragging");
+      this.panel.classList.remove("resizing");
+      this.fab.classList.remove("resizing");
+      document.documentElement.classList.remove("ai-helper-sidebar-resizing");
+      this.saveWidth();
+    };
+
+    this.resizeHandle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || this.collapsed) return;
+      event.preventDefault();
+      event.stopPropagation();
+      pointerId = event.pointerId;
+      this.resizeHandle.setPointerCapture(pointerId);
+      this.resizeHandle.classList.add("dragging");
+      this.panel.classList.add("resizing");
+      this.fab.classList.add("resizing");
+      document.documentElement.classList.add("ai-helper-sidebar-resizing");
+    });
+
+    this.resizeHandle.addEventListener("pointermove", (event) => {
+      if (pointerId !== event.pointerId) return;
+      event.preventDefault();
+      this.setPanelWidth(window.innerWidth - event.clientX);
+    });
+
+    this.resizeHandle.addEventListener("pointerup", finish);
+    this.resizeHandle.addEventListener("pointercancel", finish);
+    this.resizeHandle.addEventListener("lostpointercapture", () => {
+      if (pointerId != null) finish();
     });
   }
 
@@ -489,6 +729,9 @@ export class Sidebar {
       ) as HTMLTextAreaElement | null;
       input?.focus({ preventScroll: true });
       input?.setSelectionRange(focusState.start, focusState.end);
+    }
+    if (this.activeId && this.expanded.has(this.activeId)) {
+      this.scrollThreadToBottom(this.activeId);
     }
   }
 
@@ -540,7 +783,7 @@ export class Sidebar {
     deleteBtn.type = "button";
     deleteBtn.className = "menu-item";
     deleteBtn.setAttribute("role", "menuitem");
-    deleteBtn.textContent = "Delete thread";
+    deleteBtn.textContent = "Remove thread & highlight";
     deleteBtn.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -615,11 +858,15 @@ export class Sidebar {
     const doSend = async () => {
       const question = input.value.trim();
       if (!question || this.sending.has(thread.id)) return;
+
+      // Clear immediately on Enter/click so the composer never looks frozen.
+      input.value = "";
+      this.drafts.delete(thread.id);
+      autoGrow();
       this.sending.add(thread.id);
       this.errors.delete(thread.id);
-      // Clear the composer while waiting so the draft isn't stuck on screen.
-      this.drafts.delete(thread.id);
       this.renderList();
+      this.scrollThreadToBottom(thread.id);
       const patch = rafThrottle((partial: string) =>
         this.patchAssistantReply(thread.id, partial)
       );
@@ -646,6 +893,12 @@ export class Sidebar {
 
     send.addEventListener("click", () => void doSend());
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        this.closeAllMenus();
+        this.setCollapsed(true);
+        return;
+      }
       // Shift+Enter inserts a newline; Enter during IME composition confirms text.
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();

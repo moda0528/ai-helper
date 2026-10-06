@@ -13,6 +13,7 @@ installSidebarInputGuard();
 const ADAPTERS: Record<string, () => SiteAdapter> = {
   "chatgpt.com": createChatGptAdapter,
   "www.chatgpt.com": createChatGptAdapter,
+  "chat.openai.com": createChatGptAdapter,
   "claude.ai": createClaudeAdapter,
   "gemini.google.com": createGeminiAdapter,
 };
